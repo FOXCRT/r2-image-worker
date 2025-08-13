@@ -11,20 +11,22 @@ type Bindings = {
 }
 
 const maxAge = 60 * 60 * 24 * 30
+
 const app = new Hono<{ Bindings: Bindings }>()
 
+// PUTエンドポイント
 app.put('/upload', async (c, next) => {
   const auth = basicAuth({ username: c.env.USER, password: c.env.PASS })
   await auth(c, next)
 })
 
 app.put('/upload', async (c) => {
-  const data = await c.req.parseBody<{ 
+  const data = await c.req.parseBody<{
     image: File
     width?: string
     height?: string
-    timestamp?: string  // "true" or "false"
-    sha256?: string     // "true" or "false"
+    timestamp?: string
+    sha256?: string
   }>()
   
   const file = data.image
@@ -36,20 +38,17 @@ app.put('/upload', async (c) => {
   const extension = nameParts.pop() || 'png'
   const basename = nameParts.join('.')
   
-  let key = file.name  // デフォルトは元のファイル名
+  let key = file.name
   
-  // SHA256オプション、タイムスタンプオプション、またはその両方
   if (useSha256 || useTimestamp) {
     const parts = []
     parts.push(basename)
     
-    // SHA256ハッシュを追加（最初の8文字）
     if (useSha256) {
       const hash = (await sha256(file)).substring(0, 8)
       parts.push(hash)
     }
     
-    // タイムスタンプとランダム文字列を追加
     if (useTimestamp) {
       const timestamp = Date.now()
       const random = Math.random().toString(36).substring(2, 8)
@@ -59,7 +58,6 @@ app.put('/upload', async (c) => {
     key = `${parts.join('_')}.${extension}`
   }
   
-  // widthとheightが指定されている場合
   if (data.width && data.height) {
     const keyParts = key.split('.')
     const ext = keyParts.pop()
@@ -78,15 +76,35 @@ app.get(
   })
 )
 
+// CORSプリフライト対応
+app.options('*', (c) => {
+  return c.text('', 204, {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS, PUT',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400'
+  })
+})
+
+// 画像配信エンドポイント（CORS対応）
 app.get('/:key', async (c) => {
   const key = c.req.param('key')
   const object = await c.env.BUCKET.get(key)
+  
   if (!object) return c.notFound()
+  
   const data = await object.arrayBuffer()
   const contentType = object.httpMetadata?.contentType ?? ''
+  
+  // CORSヘッダーを追加
   return c.body(data, 200, {
     'Cache-Control': `public, max-age=${maxAge}`,
-    'Content-Type': contentType
+    'Content-Type': contentType,
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Expose-Headers': 'Content-Disposition',
+    'Content-Disposition': `inline; filename="${key}"`
   })
 })
 
