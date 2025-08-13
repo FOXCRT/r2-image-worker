@@ -11,7 +11,6 @@ type Bindings = {
 }
 
 const maxAge = 60 * 60 * 24 * 30
-
 const app = new Hono<{ Bindings: Bindings }>()
 
 // PUTエンドポイント
@@ -72,7 +71,8 @@ app.put('/upload', async (c) => {
 app.get(
   '*',
   cache({
-    cacheName: 'r2-image-worker'
+    cacheName: 'r2-image-worker',
+    cacheControl: `public, max-age=${maxAge}`
   })
 )
 
@@ -81,12 +81,31 @@ app.options('*', (c) => {
   return c.text('', 204, {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS, PUT',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Max-Age': '86400'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range',
+    'Access-Control-Max-Age': '86400',
+    'Access-Control-Allow-Credentials': 'false'
   })
 })
 
-// 画像配信エンドポイント（CORS対応）
+// HEADリクエスト対応（ファイル存在確認用）
+app.head('/:key', async (c) => {
+  const key = c.req.param('key')
+  const object = await c.env.BUCKET.head(key)
+  
+  if (!object) return c.notFound()
+  
+  return c.body(null, 200, {
+    'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
+    'Content-Length': object.size.toString(),
+    'ETag': object.httpEtag || object.etag,
+    'Last-Modified': object.uploaded.toUTCString(),
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Type, ETag, Last-Modified'
+  })
+})
+
+// 画像配信エンドポイント（CORS対応強化）
 app.get('/:key', async (c) => {
   const key = c.req.param('key')
   const object = await c.env.BUCKET.get(key)
@@ -94,18 +113,48 @@ app.get('/:key', async (c) => {
   if (!object) return c.notFound()
   
   const data = await object.arrayBuffer()
-  const contentType = object.httpMetadata?.contentType ?? ''
+  const contentType = object.httpMetadata?.contentType ?? 'application/octet-stream'
   
-  // CORSヘッダーを追加
-  return c.body(data, 200, {
-    'Cache-Control': `public, max-age=${maxAge}`,
+  // クエリパラメータでダウンロードモードを制御
+  const url = new URL(c.req.url)
+  const forceDownload = url.searchParams.get('download') === 'true'
+  
+  // スクリーンショットかどうかを判定
+  const isScreenshot = key.includes('screenshot_')
+  
+  // Content-Dispositionの設定
+  let contentDisposition = 'inline'
+  if (forceDownload || (isScreenshot && c.req.header('User-Agent')?.includes('Mobile'))) {
+    // 強制ダウンロードまたはモバイルからのスクリーンショットアクセス
+    contentDisposition = 'attachment'
+  }
+  
+  // ファイル名を適切にエンコード（日本語等の対応）
+  const filename = key.split('/').pop() || 'download'
+  const encodedFilename = encodeURIComponent(filename)
+  
+  // レスポンスヘッダー
+  const headers: Record<string, string> = {
+    'Cache-Control': `public, max-age=${isScreenshot ? 3600 : maxAge}`, // スクリーンショットは1時間キャッシュ
     'Content-Type': contentType,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Expose-Headers': 'Content-Disposition',
-    'Content-Disposition': `inline; filename="${key}"`
-  })
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Type, Content-Disposition, ETag, Last-Modified',
+    'Access-Control-Allow-Credentials': 'false',
+    'Content-Disposition': `${contentDisposition}; filename="${filename}"; filename*=UTF-8''${encodedFilename}`,
+    'X-Content-Type-Options': 'nosniff'
+  }
+  
+  // 追加のメタデータがあれば設定
+  if (object.httpEtag || object.etag) {
+    headers['ETag'] = object.httpEtag || object.etag
+  }
+  if (object.uploaded) {
+    headers['Last-Modified'] = object.uploaded.toUTCString()
+  }
+  
+  return c.body(data, 200, headers)
 })
 
 export default app
