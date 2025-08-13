@@ -1,4 +1,5 @@
 import { Hono } from 'hono/quick'
+import { cors } from 'hono/cors'  // ビルトインCORSミドルウェア
 import { cache } from 'hono/cache'
 import { sha256 } from 'hono/utils/crypto'
 import { basicAuth } from 'hono/basic-auth'
@@ -7,53 +8,45 @@ type Bindings = {
   BUCKET: R2Bucket
   USER: string
   PASS: string
+  ALLOWED_ORIGINS?: string  // 環境変数で制御可能
 }
 
-const maxAge = 60 * 60 * 24 * 30
 const app = new Hono<{ Bindings: Bindings }>()
 
-// CORSヘッダーを設定する共通関数
-const setCorsHeaders = (headers: Headers): Headers => {
-  headers.set('Access-Control-Allow-Origin', '*')
-  headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS, PUT')
-  headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range, Accept')
-  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Type, Content-Disposition, ETag, Last-Modified')
-  headers.set('Access-Control-Allow-Credentials', 'false')
-  return headers
-}
+// 1. CORSミドルウェアを最初に適用（重要）
+app.use('*', cors({
+  origin: (origin, c) => {
+    // 環境変数でオリジンを制御
+    const allowedOrigins = c.env.ALLOWED_ORIGINS?.split(',') || ['*']
+    if (allowedOrigins.includes('*')) return '*'
+    if (allowedOrigins.includes(origin)) return origin
+    return allowedOrigins[0] // デフォルトは最初のオリジン
+  },
+  allowMethods: ['GET', 'HEAD', 'OPTIONS', 'PUT'],
+  allowHeaders: ['Content-Type', 'Authorization', 'Range', 'If-None-Match'],
+  exposeHeaders: [
+    'Content-Length',
+    'Content-Type', 
+    'Content-Disposition',
+    'Content-Range',
+    'ETag',
+    'Last-Modified',
+    'Accept-Ranges'
+  ],
+  credentials: false,
+  maxAge: 86400
+}))
 
-// 全リクエストにCORSヘッダーを追加するミドルウェア
-app.use('*', async (c, next) => {
-  await next()
-  
-  // レスポンスにCORSヘッダーを追加
-  const headers = new Headers(c.res.headers)
-  setCorsHeaders(headers)
-  
-  // 新しいレスポンスを作成
-  const body = c.res.body
-  const newResponse = new Response(body, {
-    status: c.res.status,
-    statusText: c.res.statusText,
-    headers: headers
-  })
-  
-  return newResponse
-})
+// 2. キャッシュミドルウェア（GETリクエストのみ）
+app.get('*', cache({
+  cacheName: 'r2-image-cache',
+  cacheControl: 'public, max-age=3600',
+  wait: true,
+  // CORSヘッダーも含めてキャッシュされるように
+  vary: ['Origin', 'Access-Control-Request-Headers']
+}))
 
-// OPTIONSリクエスト（CORSプリフライト）の処理
-app.options('*', (c) => {
-  const headers = new Headers()
-  setCorsHeaders(headers)
-  headers.set('Access-Control-Max-Age', '86400')
-  
-  return new Response(null, {
-    status: 204,
-    headers: headers
-  })
-})
-
-// PUTエンドポイントの認証
+// PUTエンドポイント（アップロード）
 app.put('/upload', async (c, next) => {
   const auth = basicAuth({ username: c.env.USER, password: c.env.PASS })
   await auth(c, next)
@@ -104,131 +97,200 @@ app.put('/upload', async (c) => {
     key = `${base}_${data.width}x${data.height}.${ext}`
   }
   
-  await c.env.BUCKET.put(key, file, { httpMetadata: { contentType: type } })
-  return c.text(key)
+  await c.env.BUCKET.put(key, file, { 
+    httpMetadata: { 
+      contentType: type,
+      cacheControl: 'public, max-age=31536000' // 1年キャッシュ
+    } 
+  })
+  
+  return c.json({ 
+    success: true, 
+    key: key,
+    url: `${new URL(c.req.url).origin}/${key}`
+  })
 })
 
-// メインの画像配信エンドポイント（GET/HEAD両方に対応）
-app.all('/:key', async (c) => {
+// 画像配信エンドポイント（GET/HEAD対応）
+app.on(['GET', 'HEAD'], '/:key{.+}', async (c) => {
   const key = c.req.param('key')
   const method = c.req.method
   
-  // HEADリクエストの場合
-  if (method === 'HEAD') {
-    try {
+  try {
+    // HEADリクエストの場合はメタデータのみ
+    if (method === 'HEAD') {
       const object = await c.env.BUCKET.head(key)
       
       if (!object) {
         return c.notFound()
       }
       
-      const headers = new Headers()
-      headers.set('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream')
-      headers.set('Content-Length', object.size.toString())
-      headers.set('ETag', object.httpEtag || object.etag)
-      headers.set('Last-Modified', object.uploaded.toUTCString())
-      setCorsHeaders(headers)
+      // ETagベースのキャッシュ制御
+      const etag = object.httpEtag || object.etag
+      const ifNoneMatch = c.req.header('If-None-Match')
       
-      return new Response(null, {
-        status: 200,
-        headers: headers
-      })
-    } catch (error) {
-      return c.notFound()
+      if (ifNoneMatch && ifNoneMatch === etag) {
+        return c.body(null, 304)
+      }
+      
+      c.header('Content-Type', object.httpMetadata?.contentType || getContentType(key))
+      c.header('Content-Length', object.size.toString())
+      c.header('Accept-Ranges', 'bytes')
+      c.header('ETag', etag)
+      c.header('Last-Modified', object.uploaded.toUTCString())
+      c.header('Cache-Control', getCacheControl(key))
+      
+      return c.body(null)
     }
-  }
-  
-  // GETリクエストの場合
-  if (method === 'GET') {
-    try {
-      // キャッシュのチェック
-      const cacheKey = new Request(c.req.url)
-      const cacheStore = caches.default
-      
-      // キャッシュから取得を試みる
-      let cachedResponse = await cacheStore.match(cacheKey)
-      
-      if (cachedResponse) {
-        // キャッシュヒット時もCORSヘッダーを確実に設定
-        const headers = new Headers(cachedResponse.headers)
-        setCorsHeaders(headers)
+    
+    // GETリクエストの処理
+    const url = new URL(c.req.url)
+    const forceDownload = url.searchParams.get('download') === 'true'
+    
+    // Rangeヘッダーの処理（部分ダウンロード対応）
+    const range = c.req.header('Range')
+    let object: R2Object | R2ObjectBody
+    let status = 200
+    let contentRange: string | undefined
+    
+    if (range) {
+      // Range対応
+      const matches = range.match(/bytes=(\d+)-(\d*)/)
+      if (matches) {
+        const start = parseInt(matches[1], 10)
+        const end = matches[2] ? parseInt(matches[2], 10) : undefined
         
-        return new Response(cachedResponse.body, {
-          status: cachedResponse.status,
-          headers: headers
+        object = await c.env.BUCKET.get(key, {
+          range: { offset: start, length: end ? end - start + 1 : undefined }
         })
+        
+        if (object) {
+          status = 206 // Partial Content
+          const totalSize = 'size' in object ? object.size : 0
+          contentRange = `bytes ${start}-${end || totalSize - 1}/${totalSize}`
+        }
+      } else {
+        object = await c.env.BUCKET.get(key)
       }
-      
-      // R2から取得
-      const object = await c.env.BUCKET.get(key)
-      
-      if (!object) {
-        return c.notFound()
-      }
-      
-      const data = await object.arrayBuffer()
-      const contentType = object.httpMetadata?.contentType || 'application/octet-stream'
-      
-      // クエリパラメータでダウンロードモードを制御
-      const url = new URL(c.req.url)
-      const forceDownload = url.searchParams.get('download') === 'true'
-      
-      // スクリーンショットかどうかを判定
-      const isScreenshot = key.includes('screenshot_')
-      
-      // User-Agentからモバイルを検出
-      const userAgent = c.req.header('User-Agent') || ''
-      const isMobile = /iPhone|iPad|iPod|Android/i.test(userAgent)
-      
-      // Content-Dispositionの設定
-      let contentDisposition = 'inline'
-      if (forceDownload || (isScreenshot && isMobile)) {
-        contentDisposition = 'attachment'
-      }
-      
-      // ファイル名を適切にエンコード
-      const filename = key.split('/').pop() || 'download'
-      const encodedFilename = encodeURIComponent(filename)
-      
-      // レスポンスヘッダーを設定
-      const headers = new Headers()
-      headers.set('Content-Type', contentType)
-      headers.set('Cache-Control', `public, max-age=${isScreenshot ? 3600 : maxAge}`)
-      headers.set('Content-Disposition', `${contentDisposition}; filename="${filename}"; filename*=UTF-8''${encodedFilename}`)
-      headers.set('X-Content-Type-Options', 'nosniff')
-      
-      // 追加メタデータ
-      if (object.httpEtag || object.etag) {
-        headers.set('ETag', object.httpEtag || object.etag)
-      }
-      if (object.uploaded) {
-        headers.set('Last-Modified', object.uploaded.toUTCString())
-      }
-      
-      // CORSヘッダーを設定
-      setCorsHeaders(headers)
-      
-      // レスポンスを作成
-      const response = new Response(data, {
-        status: 200,
-        headers: headers
-      })
-      
-      // キャッシュに保存（非同期）
-      c.executionCtx.waitUntil(
-        cacheStore.put(cacheKey, response.clone())
-      )
-      
-      return response
-      
-    } catch (error) {
-      console.error('Error fetching from R2:', error)
+    } else {
+      // 通常のGETリクエスト
+      object = await c.env.BUCKET.get(key)
+    }
+    
+    if (!object) {
       return c.notFound()
     }
+    
+    // ETagベースのキャッシュ制御
+    const etag = object.httpEtag || object.etag
+    const ifNoneMatch = c.req.header('If-None-Match')
+    
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      return c.body(null, 304)
+    }
+    
+    // レスポンスボディの取得
+    const body = 'body' in object ? object.body : null
+    if (!body) {
+      return c.notFound()
+    }
+    
+    // Content-Dispositionの設定
+    const isScreenshot = key.includes('screenshot_')
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(c.req.header('User-Agent') || '')
+    
+    let contentDisposition = 'inline'
+    if (forceDownload) {
+      contentDisposition = 'attachment'
+    } else if (isScreenshot && isMobile) {
+      // モバイルでスクリーンショットは自動的にダウンロード
+      contentDisposition = 'attachment'
+    }
+    
+    const filename = key.split('/').pop() || 'download'
+    const encodedFilename = encodeURIComponent(filename)
+    
+    // レスポンスヘッダーの設定
+    c.header('Content-Type', object.httpMetadata?.contentType || getContentType(key))
+    c.header('Content-Disposition', `${contentDisposition}; filename="${filename}"; filename*=UTF-8''${encodedFilename}`)
+    c.header('Cache-Control', getCacheControl(key))
+    c.header('ETag', etag)
+    c.header('Last-Modified', object.uploaded.toUTCString())
+    c.header('Accept-Ranges', 'bytes')
+    c.header('X-Content-Type-Options', 'nosniff')
+    
+    if (contentRange) {
+      c.header('Content-Range', contentRange)
+    }
+    
+    // ArrayBufferに変換して返す
+    const data = await streamToArrayBuffer(body)
+    return c.body(data, status)
+    
+  } catch (error) {
+    console.error('Error serving file:', error)
+    return c.json({ error: 'Internal Server Error' }, 500)
+  }
+})
+
+// 404ハンドラー
+app.notFound((c) => {
+  return c.json({ error: 'Not Found' }, 404)
+})
+
+// エラーハンドラー
+app.onError((err, c) => {
+  console.error('Worker error:', err)
+  return c.json({ error: 'Internal Server Error' }, 500)
+})
+
+// ヘルパー関数
+function getContentType(key: string): string {
+  const ext = key.split('.').pop()?.toLowerCase()
+  const mimeTypes: Record<string, string> = {
+    'png': 'image/png',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'gif': 'image/gif',
+    'webp': 'image/webp',
+    'svg': 'image/svg+xml',
+    'ico': 'image/x-icon',
+    'bmp': 'image/bmp',
+    'tiff': 'image/tiff',
+    'pdf': 'application/pdf'
+  }
+  return mimeTypes[ext || ''] || 'application/octet-stream'
+}
+
+function getCacheControl(key: string): string {
+  // スクリーンショットは短めのキャッシュ
+  if (key.includes('screenshot_')) {
+    return 'public, max-age=3600' // 1時間
+  }
+  // ロゴなどの静的画像は長期キャッシュ
+  return 'public, max-age=31536000, immutable' // 1年
+}
+
+async function streamToArrayBuffer(stream: ReadableStream): Promise<ArrayBuffer> {
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) chunks.push(value)
   }
   
-  // その他のメソッドは許可しない
-  return c.text('Method Not Allowed', 405)
-})
+  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0)
+  const result = new Uint8Array(totalLength)
+  let offset = 0
+  
+  for (const chunk of chunks) {
+    result.set(chunk, offset)
+    offset += chunk.length
+  }
+  
+  return result.buffer
+}
 
 export default app
