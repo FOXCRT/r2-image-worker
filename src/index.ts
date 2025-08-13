@@ -2,7 +2,7 @@ import { Hono } from 'hono/quick'
 import { cache } from 'hono/cache'
 import { sha256 } from 'hono/utils/crypto'
 import { basicAuth } from 'hono/basic-auth'
-import { getExtension } from 'hono/utils/mime'
+import { cors } from 'hono/cors'
 
 type Bindings = {
   BUCKET: R2Bucket
@@ -13,7 +13,17 @@ type Bindings = {
 const maxAge = 60 * 60 * 24 * 30
 const app = new Hono<{ Bindings: Bindings }>()
 
-// PUTエンドポイント
+// 【重要】CORSミドルウェアを最初に設定
+app.use('*', cors({
+  origin: '*', // 本番環境では特定のドメインに制限することを推奨
+  allowMethods: ['GET', 'HEAD', 'PUT', 'POST', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'Range', 'Accept'],
+  exposeHeaders: ['Content-Length', 'Content-Type', 'Content-Disposition', 'ETag', 'Last-Modified'],
+  credentials: false,
+  maxAge: 86400
+}))
+
+// PUTエンドポイントの認証
 app.put('/upload', async (c, next) => {
   const auth = basicAuth({ username: c.env.USER, password: c.env.PASS })
   await auth(c, next)
@@ -68,52 +78,63 @@ app.put('/upload', async (c) => {
   return c.text(key)
 })
 
-app.get(
-  '*',
-  cache({
-    cacheName: 'r2-image-worker',
-    cacheControl: `public, max-age=${maxAge}`
-  })
-)
-
-// CORSプリフライト対応
-app.options('*', (c) => {
-  return c.text('', 204, {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS, PUT',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range',
-    'Access-Control-Max-Age': '86400',
-    'Access-Control-Allow-Credentials': 'false'
-  })
-})
-
-// HEADリクエスト対応（ファイル存在確認用）
+// HEADリクエスト対応
 app.head('/:key', async (c) => {
   const key = c.req.param('key')
-  const object = await c.env.BUCKET.head(key)
   
-  if (!object) return c.notFound()
-  
-  return c.body(null, 200, {
-    'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
-    'Content-Length': object.size.toString(),
-    'ETag': object.httpEtag || object.etag,
-    'Last-Modified': object.uploaded.toUTCString(),
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-    'Access-Control-Expose-Headers': 'Content-Length, Content-Type, ETag, Last-Modified'
-  })
+  try {
+    const object = await c.env.BUCKET.head(key)
+    
+    if (!object) {
+      return c.notFound()
+    }
+    
+    // ヘッダーを設定してレスポンス
+    c.header('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream')
+    c.header('Content-Length', object.size.toString())
+    c.header('ETag', object.httpEtag || object.etag)
+    c.header('Last-Modified', object.uploaded.toUTCString())
+    
+    return c.body(null)
+  } catch (error) {
+    return c.notFound()
+  }
 })
 
-// 画像配信エンドポイント（CORS対応強化）
+// GETエンドポイント - キャッシュとCORSの両立
 app.get('/:key', async (c) => {
   const key = c.req.param('key')
+  
+  // キャッシュのチェック（手動実装）
+  const cacheKey = new Request(c.req.url)
+  const cache = caches.default
+  
+  // キャッシュから取得を試みる
+  let response = await cache.match(cacheKey)
+  
+  if (response) {
+    // キャッシュヒット時もCORSヘッダーを確実に設定
+    const headers = new Headers(response.headers)
+    headers.set('Access-Control-Allow-Origin', '*')
+    headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Type, Content-Disposition, ETag, Last-Modified')
+    
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: headers
+    })
+  }
+  
+  // R2から取得
   const object = await c.env.BUCKET.get(key)
   
-  if (!object) return c.notFound()
+  if (!object) {
+    return c.notFound()
+  }
   
   const data = await object.arrayBuffer()
-  const contentType = object.httpMetadata?.contentType ?? 'application/octet-stream'
+  const contentType = object.httpMetadata?.contentType || 'application/octet-stream'
   
   // クエリパラメータでダウンロードモードを制御
   const url = new URL(c.req.url)
@@ -122,39 +143,62 @@ app.get('/:key', async (c) => {
   // スクリーンショットかどうかを判定
   const isScreenshot = key.includes('screenshot_')
   
+  // User-Agentからモバイルを検出
+  const userAgent = c.req.header('User-Agent') || ''
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(userAgent)
+  
   // Content-Dispositionの設定
   let contentDisposition = 'inline'
-  if (forceDownload || (isScreenshot && c.req.header('User-Agent')?.includes('Mobile'))) {
-    // 強制ダウンロードまたはモバイルからのスクリーンショットアクセス
+  if (forceDownload || (isScreenshot && isMobile)) {
     contentDisposition = 'attachment'
   }
   
-  // ファイル名を適切にエンコード（日本語等の対応）
+  // ファイル名を適切にエンコード
   const filename = key.split('/').pop() || 'download'
   const encodedFilename = encodeURIComponent(filename)
   
-  // レスポンスヘッダー
-  const headers: Record<string, string> = {
-    'Cache-Control': `public, max-age=${isScreenshot ? 3600 : maxAge}`, // スクリーンショットは1時間キャッシュ
+  // レスポンスヘッダーを設定
+  const headers = new Headers({
     'Content-Type': contentType,
+    'Cache-Control': `public, max-age=${isScreenshot ? 3600 : maxAge}`,
+    'Content-Disposition': `${contentDisposition}; filename="${filename}"; filename*=UTF-8''${encodedFilename}`,
+    'X-Content-Type-Options': 'nosniff',
+    // CORSヘッダーを明示的に設定
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Range',
     'Access-Control-Expose-Headers': 'Content-Length, Content-Type, Content-Disposition, ETag, Last-Modified',
-    'Access-Control-Allow-Credentials': 'false',
-    'Content-Disposition': `${contentDisposition}; filename="${filename}"; filename*=UTF-8''${encodedFilename}`,
-    'X-Content-Type-Options': 'nosniff'
-  }
+    'Access-Control-Allow-Credentials': 'false'
+  })
   
-  // 追加のメタデータがあれば設定
+  // 追加メタデータ
   if (object.httpEtag || object.etag) {
-    headers['ETag'] = object.httpEtag || object.etag
+    headers.set('ETag', object.httpEtag || object.etag)
   }
   if (object.uploaded) {
-    headers['Last-Modified'] = object.uploaded.toUTCString()
+    headers.set('Last-Modified', object.uploaded.toUTCString())
   }
   
-  return c.body(data, 200, headers)
+  // レスポンスを作成
+  const newResponse = new Response(data, {
+    status: 200,
+    headers: headers
+  })
+  
+  // キャッシュに保存（CORSヘッダー付きで）
+  c.executionCtx.waitUntil(cache.put(cacheKey, newResponse.clone()))
+  
+  return newResponse
+})
+
+// 404エラーハンドラー
+app.notFound((c) => {
+  return c.json({ error: 'Not Found' }, 404)
+})
+
+// エラーハンドラー
+app.onError((err, c) => {
+  console.error('Error:', err)
+  return c.json({ error: 'Internal Server Error' }, 500)
 })
 
 export default app
