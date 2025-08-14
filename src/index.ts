@@ -46,79 +46,81 @@ app.get('*', cache({
   vary: ['Origin', 'Access-Control-Request-Headers']
 }))
 
-// BasicAuth ミドルウェア（元の実装どおり）
-app.put('/upload', async (c, next) => {
-  try {
-    const auth = basicAuth({ username: c.env.USER, password: c.env.PASS })
-    await auth(c, next)
-  } catch (e) {
-    console.error('Auth error:', e)
-    return c.json({ 
-      error: 'Auth failed', 
-      details: e instanceof Error ? e.message : String(e) 
-    }, 401)
-  }
-})
-
-app.put('/upload', async (c) => {
-  try {
-    console.log('Upload handler started')
-    
-    // 環境変数チェック
-    if (!c.env.BUCKET) {
-      console.error('BUCKET not bound')
-      return c.json({ error: 'BUCKET not configured' }, 500)
+app.put('/upload', 
+  basicAuth({
+    verifyUser: (username, password, c) => {
+      return username === c.env.USER && password === c.env.PASS
     }
-    
-    // parseBody
-    let data
+  }),
+  async (c) => {
     try {
-      data = await c.req.parseBody()
-      console.log('ParseBody success, keys:', Object.keys(data))
-    } catch (e) {
-      console.error('ParseBody error:', e)
-      return c.json({ 
-        error: 'ParseBody failed', 
-        details: e instanceof Error ? e.message : String(e) 
-      }, 400)
-    }
-    
-    const file = data.image as File
-    if (!file) {
-      return c.json({ error: 'No image file in request' }, 400)
-    }
-    
-    console.log('File info:', file.name, file.size, file.type)
-    
-    // シンプルなファイル名でアップロード（デバッグ用）
-    const key = `test_${Date.now()}_${file.name}`
-    
-    try {
+      const data = await c.req.parseBody<{
+        image: File
+        width?: string
+        height?: string
+        timestamp?: string
+        sha256?: string
+      }>()
+      
+      const file = data.image
+      if (!file || !(file instanceof File)) {
+        return c.json({ error: 'No image file provided' }, 400)
+      }
+      
+      const type = file.type || 'application/octet-stream'
+      const useTimestamp = data.timestamp === 'true'
+      const useSha256 = data.sha256 === 'true'
+      
+      const nameParts = file.name.split('.')
+      const extension = nameParts.pop() || 'png'
+      const basename = nameParts.join('.')
+      
+      let key = file.name
+      
+      if (useSha256 || useTimestamp) {
+        const parts = []
+        parts.push(basename)
+        
+        if (useSha256) {
+          const hash = (await sha256(file)).substring(0, 8)
+          parts.push(hash)
+        }
+        
+        if (useTimestamp) {
+          const timestamp = Date.now()
+          const random = Math.random().toString(36).substring(2, 8)
+          parts.push(`${timestamp}_${random}`)
+        }
+        
+        key = `${parts.join('_')}.${extension}`
+      }
+      
+      if (data.width && data.height) {
+        const keyParts = key.split('.')
+        const ext = keyParts.pop()
+        const base = keyParts.join('.')
+        key = `${base}_${data.width}x${data.height}.${ext}`
+      }
+      
       await c.env.BUCKET.put(key, file, { 
         httpMetadata: { 
-          contentType: file.type || 'application/octet-stream' 
+          contentType: type,
+          cacheControl: 'public, max-age=31536000'
         } 
       })
-      console.log('Upload to R2 successful:', key)
-    } catch (e) {
-      console.error('R2 upload error:', e)
+      
+      // 互換性のためテキストで返す
+      return c.text(key)
+      
+    } catch (error) {
+      console.error('Upload error:', error)
       return c.json({ 
-        error: 'R2 upload failed', 
-        details: e instanceof Error ? e.message : String(e) 
+        error: 'Upload failed', 
+        details: error instanceof Error ? error.message : 'Unknown error'
       }, 500)
     }
-    
-    return c.text(key)
-    
-  } catch (e) {
-    console.error('Unexpected error:', e)
-    return c.json({ 
-      error: 'Internal Server Error', 
-      details: e instanceof Error ? e.message : String(e),
-      stack: e instanceof Error ? e.stack : undefined 
-    }, 500)
   }
-})
+)
 
 // ヘルスチェック
 app.get('/health', (c) => {
