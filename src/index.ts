@@ -22,7 +22,7 @@ app.use('*', cors({
     if (allowedOrigins.includes(origin)) return origin
     return allowedOrigins[0] // デフォルトは最初のオリジン
   },
-  allowMethods: ['GET', 'HEAD', 'OPTIONS', 'PUT'],
+  allowMethods: ['GET', 'HEAD', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'Range', 'If-None-Match'],
   exposeHeaders: [
     'Content-Length',
