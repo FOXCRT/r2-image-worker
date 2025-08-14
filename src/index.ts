@@ -50,25 +50,46 @@ app.get('*', cache({
 app.put('/upload', 
   basicAuth({
     verifyUser: (username, password, c) => {
+      // 環境変数と照合
       return username === c.env.USER && password === c.env.PASS
-    }
+    },
+    realm: 'Upload',
+    invalidUserMessage: 'Invalid credentials'
   }),
   async (c) => {
     try {
-      const data = await c.req.parseBody<{
-        image: File
-        width?: string
-        height?: string
-        timestamp?: string
-        sha256?: string
-      }>()
+      console.log('Upload request received')
+      
+      const contentType = c.req.header('Content-Type')
+      console.log('Content-Type:', contentType)
+      
+      // parseBodyでmultipart/form-dataを処理
+      let data
+      try {
+        data = await c.req.parseBody<{
+          image: File
+          width?: string
+          height?: string
+          timestamp?: string
+          sha256?: string
+        }>()
+      } catch (parseError) {
+        console.error('ParseBody error:', parseError)
+        return c.json({ 
+          error: 'Failed to parse request body',
+          details: parseError instanceof Error ? parseError.message : 'Unknown parse error'
+        }, 400)
+      }
       
       const file = data.image
-      if (!file) {
+      if (!file || !(file instanceof File)) {
+        console.error('No file provided or invalid file type')
         return c.json({ error: 'No image file provided' }, 400)
       }
       
-      const type = file.type
+      console.log('File received:', file.name, 'Size:', file.size, 'Type:', file.type)
+      
+      const type = file.type || 'application/octet-stream'
       const useTimestamp = data.timestamp === 'true'
       const useSha256 = data.sha256 === 'true'
       
@@ -83,8 +104,12 @@ app.put('/upload',
         parts.push(basename)
         
         if (useSha256) {
-          const hash = (await sha256(file)).substring(0, 8)
-          parts.push(hash)
+          // Web Crypto APIを使用してSHA-256ハッシュを生成
+          const arrayBuffer = await file.arrayBuffer()
+          const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer)
+          const hashArray = Array.from(new Uint8Array(hashBuffer))
+          const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+          parts.push(hashHex.substring(0, 8))
         }
         
         if (useTimestamp) {
@@ -103,12 +128,25 @@ app.put('/upload',
         key = `${base}_${data.width}x${data.height}.${ext}`
       }
       
-      await c.env.BUCKET.put(key, file, { 
-        httpMetadata: { 
-          contentType: type,
-          cacheControl: 'public, max-age=31536000' // 1年キャッシュ
-        } 
-      })
+      console.log('Uploading to R2 with key:', key)
+      
+      // R2へのアップロード
+      try {
+        await c.env.BUCKET.put(key, file, { 
+          httpMetadata: { 
+            contentType: type,
+            cacheControl: 'public, max-age=31536000' // 1年キャッシュ
+          } 
+        })
+      } catch (r2Error) {
+        console.error('R2 upload error:', r2Error)
+        return c.json({ 
+          error: 'Failed to upload to R2',
+          details: r2Error instanceof Error ? r2Error.message : 'Unknown R2 error'
+        }, 500)
+      }
+      
+      console.log('Upload successful:', key)
       
       return c.json({ 
         success: true, 
@@ -119,7 +157,8 @@ app.put('/upload',
       console.error('Upload error:', error)
       return c.json({ 
         error: 'Upload failed', 
-        details: error instanceof Error ? error.message : 'Unknown error'
+        details: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined
       }, 500)
     }
   }
