@@ -1,5 +1,5 @@
 import { Hono } from 'hono/quick'
-import { cors } from 'hono/cors'  // ビルトインCORSミドルウェア
+import { cors } from 'hono/cors'  
 import { cache } from 'hono/cache'
 import { sha256 } from 'hono/utils/crypto'
 import { basicAuth } from 'hono/basic-auth'
@@ -47,69 +47,84 @@ app.get('*', cache({
 }))
 
 // PUTエンドポイント（アップロード）
-app.put('/upload', async (c, next) => {
-  const auth = basicAuth({ username: c.env.USER, password: c.env.PASS })
-  await auth(c, next)
-})
+app.put('/upload', 
+  basicAuth({
+    verifyUser: (username, password, c) => {
+      return username === c.env.USER && password === c.env.PASS
+    }
+  }),
+  async (c) => {
+    try {
+      const data = await c.req.parseBody<{
+        image: File
+        width?: string
+        height?: string
+        timestamp?: string
+        sha256?: string
+      }>()
+      
+      const file = data.image
+      if (!file) {
+        return c.json({ error: 'No image file provided' }, 400)
+      }
+      
+      const type = file.type
+      const useTimestamp = data.timestamp === 'true'
+      const useSha256 = data.sha256 === 'true'
+      
+      const nameParts = file.name.split('.')
+      const extension = nameParts.pop() || 'png'
+      const basename = nameParts.join('.')
+      
+      let key = file.name
+      
+      if (useSha256 || useTimestamp) {
+        const parts = []
+        parts.push(basename)
+        
+        if (useSha256) {
+          const hash = (await sha256(file)).substring(0, 8)
+          parts.push(hash)
+        }
+        
+        if (useTimestamp) {
+          const timestamp = Date.now()
+          const random = Math.random().toString(36).substring(2, 8)
+          parts.push(`${timestamp}_${random}`)
+        }
+        
+        key = `${parts.join('_')}.${extension}`
+      }
+      
+      if (data.width && data.height) {
+        const keyParts = key.split('.')
+        const ext = keyParts.pop()
+        const base = keyParts.join('.')
+        key = `${base}_${data.width}x${data.height}.${ext}`
+      }
+      
+      await c.env.BUCKET.put(key, file, { 
+        httpMetadata: { 
+          contentType: type,
+          cacheControl: 'public, max-age=31536000' // 1年キャッシュ
+        } 
+      })
+      
+      return c.json({ 
+        success: true, 
+        key: key,
+        url: `${new URL(c.req.url).origin}/${key}`
+      })
+    } catch (error) {
+      console.error('Upload error:', error)
+      return c.json({ 
+        error: 'Upload failed', 
+        details: error instanceof Error ? error.message : 'Unknown error'
+      }, 500)
+    }
+  }
+)
 
-app.put('/upload', async (c) => {
-  const data = await c.req.parseBody<{
-    image: File
-    width?: string
-    height?: string
-    timestamp?: string
-    sha256?: string
-  }>()
-  
-  const file = data.image
-  const type = file.type
-  const useTimestamp = data.timestamp === 'true'
-  const useSha256 = data.sha256 === 'true'
-  
-  const nameParts = file.name.split('.')
-  const extension = nameParts.pop() || 'png'
-  const basename = nameParts.join('.')
-  
-  let key = file.name
-  
-  if (useSha256 || useTimestamp) {
-    const parts = []
-    parts.push(basename)
-    
-    if (useSha256) {
-      const hash = (await sha256(file)).substring(0, 8)
-      parts.push(hash)
-    }
-    
-    if (useTimestamp) {
-      const timestamp = Date.now()
-      const random = Math.random().toString(36).substring(2, 8)
-      parts.push(`${timestamp}_${random}`)
-    }
-    
-    key = `${parts.join('_')}.${extension}`
-  }
-  
-  if (data.width && data.height) {
-    const keyParts = key.split('.')
-    const ext = keyParts.pop()
-    const base = keyParts.join('.')
-    key = `${base}_${data.width}x${data.height}.${ext}`
-  }
-  
-  await c.env.BUCKET.put(key, file, { 
-    httpMetadata: { 
-      contentType: type,
-      cacheControl: 'public, max-age=31536000' // 1年キャッシュ
-    } 
-  })
-  
-  return c.json({ 
-    success: true, 
-    key: key,
-    url: `${new URL(c.req.url).origin}/${key}`
-  })
-})
 
 // 画像配信エンドポイント（GET/HEAD対応）
 app.on(['GET', 'HEAD'], '/:key{.+}', async (c) => {
